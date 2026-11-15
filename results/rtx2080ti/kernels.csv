@@ -1,0 +1,10 @@
+kernel,registers,static_shared_bytes,threads,blocks_per_sm,warps_per_sm
+naive_rows,52,0,1024,1,32
+naive_cols,52,0,1024,1,32
+smem_32,42,8192,1024,1,32
+tile_1d,64,4096,512,2,32
+tile_2d,132,8192,256,1,8
+vector,117,8192,256,2,16
+no_conflicts,114,8192,256,2,16
+double_buffer,123,16384,256,2,16
+wmma,121,18944,256,2,16
