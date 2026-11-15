@@ -1,0 +1,131 @@
+"""results/<gpu>/gemm.csv and kernels.csv into results/summary.md and figures/kernels.png.
+
+    python analysis/report.py
+"""
+
+import csv
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+RESULTS = ROOT / "results"
+FIGURES = ROOT / "figures"
+SUMMARY = RESULTS / "summary.md"
+
+# name, SMs, FP32 lanes per SM, tensor-core flops per clock per SM with fp32 accumulation
+GPUS = {
+    "rtx2080ti": {"label": "RTX 2080 Ti", "sms": 68, "fp32_lanes": 64, "tensor_fp32acc": 512, "color": "#2a78d6"},
+    "gtx1080ti": {"label": "GTX 1080 Ti", "sms": 28, "fp32_lanes": 128, "tensor_fp32acc": 0, "color": "#eb6834"},
+}
+FP32_KERNELS = ["naive_rows", "naive_cols", "smem_32", "tile_1d", "tile_2d", "vector", "no_conflicts", "double_buffer"]
+INK, MUTED, GRID = "#1f1f1e", "#6b6a64", "#e4e3de"
+
+
+def read(path):
+    with open(path, newline="") as f:
+        return [{k: _num(v) for k, v in r.items()} for r in csv.DictReader(f)]
+
+
+def _num(v):
+    for t in (int, float):
+        try:
+            return t(v)
+        except ValueError:
+            pass
+    return v
+
+
+def peak_gflops(gpu, precision, clock_mhz):
+    """FP32: two flops per FMA lane per clock. FP16 on tensor cores: flops per clock per SM
+    from the microbenchmarks (and the whitepaper), accumulating in FP32."""
+    g = GPUS[gpu]
+    per_sm = 2 * g["fp32_lanes"] if precision == "fp32" else g["tensor_fp32acc"]
+    return per_sm * g["sms"] * clock_mhz / 1e3
+
+
+def table(rows):
+    """{(kernel, precision, n): row}"""
+    return {(r["kernel"], r["precision"], r["n"]): r for r in rows}
+
+
+def summary(gpu):
+    rows = read(RESULTS / gpu / "gemm.csv")
+    t = table(rows)
+    attrs = {r["kernel"]: r for r in read(RESULTS / gpu / "kernels.csv")}
+    sizes = sorted({r["n"] for r in rows})
+    out = [f"### {GPUS[gpu]['label']}", "",
+           "GFLOP/s by matrix size (square, n x n times n x n). The last columns are at n = 4096: the share of",
+           "cuBLAS, and the share of the peak at the SM clock NVML reported right after the runs.", "",
+           "| kernel | " + " | ".join(str(n) for n in sizes) + " | % of cuBLAS | % of peak | clock, MHz | registers | warps/SM |",
+           "|---|" + "---|" * (len(sizes) + 5)]
+    for prec, names in (("fp32", ["cublas"] + FP32_KERNELS), ("fp16", ["cublas", "wmma"])):
+        if ("cublas", prec, 4096) not in t:
+            continue
+        base = t[("cublas", prec, 4096)]["gflops"]
+        for k in names:
+            cells = [f"{t[(k, prec, n)]['gflops']:,.0f}" if (k, prec, n) in t else "-" for n in sizes]
+            r = t.get((k, prec, 4096))
+            a = attrs.get(k if k != "cublas" else "", {})
+            label = f"cuBLAS {prec}" if k == "cublas" else k
+            if r:
+                pct = f"{100 * r['gflops'] / base:.0f}%"
+                peak = f"{100 * r['gflops'] / peak_gflops(gpu, prec, r['sm_clock_mhz']):.0f}%"
+                clock = f"{r['sm_clock_mhz']:.0f}"
+            else:
+                pct = peak = clock = "-"
+            out.append(f"| {label} | " + " | ".join(cells) +
+                       f" | {pct} | {peak} | {clock} | {a.get('registers', '-')} | {a.get('warps_per_sm', '-')} |")
+    return out
+
+
+def plot():
+    fig, ax = plt.subplots(figsize=(8, 4.6), dpi=150)
+    names = FP32_KERNELS
+    h = 0.38
+    for i, gpu in enumerate(GPUS):
+        t = table(read(RESULTS / gpu / "gemm.csv"))
+        base = t[("cublas", "fp32", 4096)]["gflops"]
+        ys = [len(names) - 1 - j + (h / 2 if i == 0 else -h / 2) for j in range(len(names))]
+        vals = [100 * t[(k, "fp32", 4096)]["gflops"] / base for k in names]
+        ax.barh(ys, vals, height=h - 0.04, color=GPUS[gpu]["color"], label=GPUS[gpu]["label"])
+        for y, v, k in zip(ys, vals, names):
+            g = t[(k, "fp32", 4096)]["gflops"] / 1e3
+            ax.annotate(f"{v:.0f}%  ({g:.1f} TFLOPS)", (v, y), textcoords="offset points", xytext=(4, -3),
+                        fontsize=7, color=INK)
+    ax.set_yticks(range(len(names)), list(reversed(names)), fontsize=8)
+    ax.set_xlim(0, 130)
+    ax.axvline(100, color=MUTED, lw=1, ls=(0, (4, 3)))
+    ax.annotate("cuBLAS", (100, -0.75), textcoords="offset points", xytext=(3, 0), fontsize=8, color=MUTED)
+    ax.set_xlabel("speed as % of cuBLAS SGEMM on the same GPU, n = 4096", color=MUTED)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    for s in ("left", "bottom"):
+        ax.spines[s].set_color(GRID)
+    ax.tick_params(colors=MUTED, labelsize=8)
+    ax.grid(axis="x", color=GRID, lw=0.8)
+    ax.set_axisbelow(True)
+    ax.legend(frameon=False, fontsize=9, loc="upper right")
+    ax.set_title("FP32 matrix multiply, one optimisation at a time", fontsize=11, color=INK, loc="left")
+    fig.tight_layout()
+    FIGURES.mkdir(exist_ok=True)
+    fig.savefig(FIGURES / "kernels.png")
+    plt.close(fig)
+
+
+def main(quiet=False):
+    out = ["# Summary", "", "Generated by `analysis/report.py` from `results/<gpu>/*.csv`.", ""]
+    for gpu in GPUS:
+        if (RESULTS / gpu / "gemm.csv").exists():
+            out += summary(gpu) + [""]
+    SUMMARY.write_text("\n".join(out) + "\n")
+    plot()
+    if not quiet:
+        print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()
